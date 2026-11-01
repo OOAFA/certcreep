@@ -17,6 +17,7 @@ Why this exists:
 - IDN in (`яндекс.рф`, CJK) → punycode query; U-label kept on the record
 - crt.sh JSON: apex **and** `%.apex` (the wildcard query alone misses the corporate apex)
 - Optional precert.ru AJAX (RU logs). Isolated behind `--source` so a scrape break does not fail the lab
+- Optional crt.name subdomain index (`/v1/search`, free, no token, 100 requests per IP per day). Opt-in via `--source crtname` or `--source all`; names merge into the same per-name records, tagged `crtname`
 - In-scope filter (name == apex or ends with `.apex`); `--siblings` keeps out-of-scope SANs separately
 - Wildcard marker preserved (`*.corp.example.ru` stays a wildcard, not a fake host)
 - Per-name rollup: first seen, last seen, latest `not_after`, issuer set, source set
@@ -54,17 +55,32 @@ python3 certcreep.py -d example.ru --source precert
 # Chrome-log world only
 python3 certcreep.py -d example.com --source crtsh --dedupe-certs --exclude-expired
 
+# crt.name index only (eTLD+1 apex; a sub-apex is retried at its eTLD+1 and scoped back down)
+python3 certcreep.py -d example.com --source crtname
+
+# Every index: crt.sh + precert.ru + crt.name, merged and deduplicated per name
+python3 certcreep.py -d example.com --source all --json -o ct-example.json
+
 # Keep partner / CDN SANs that shared a cert with the apex
 python3 certcreep.py -d vk.com --siblings --limit 80
 ```
 
 Stderr is the operator view (counts, states, hinted names). Stdout / `-o` is the list.
 
-If both indexes fail:
+If every queried index fails:
 
 1. Browser: `https://crt.sh/?q=<apex>` via LibreWolf with the S3 `rus` / `chn` profile
 2. `https://precert.ru`
-3. `https://transparencyreport.google.com/https/certificates`
+3. `https://crt.name/v1/search?apex=<apex>`
+4. `https://transparencyreport.google.com/https/certificates`
+
+### crt.name notes
+
+- Endpoint: `GET https://crt.name/v1/search?apex=<eTLD+1>&format=json&dates=1` → `[{"sub": "...", "first_seen": "...Z"}, ...]`.
+- The index stores only `(apex, subdomain, first-seen)`: no issuer, no `not_after`. Names seen only by crt.name have `first_seen` / `last_seen` set to the crt.name first-seen date and state `unknown`; names also seen on crt.sh keep crt.sh issuers and expiry.
+- `apex` must be an eTLD+1. If `-d` is a sub-apex (`corp.example.ru`), crt.name answers 400 with the eTLD+1; certcreep re-queries that apex once and the in-scope filter keeps only `corp.example.ru` names.
+- Free tier: 100 requests per IP per day, no token. 4xx (including 429) is not retried so the budget is not burned on retries.
+- A crt.name failure is logged on stderr and does not affect the other indexes.
 
 ---
 
@@ -75,28 +91,29 @@ If both indexes fail:
 | `-d / --domain` | required | Apex or IDN |
 | `-o / --output` | stdout | Write the list / JSON |
 | `--limit` | 200 | Applied **after** last-seen sort |
-| `--source` | `both` | `crtsh` \| `precert` \| `both` |
+| `--source` | `both` | `crtsh` \| `precert` \| `crtname` \| `both` (crt.sh + precert.ru) \| `all` (crt.sh + precert.ru + crt.name) |
 | `--exclude-expired` | off | crt.sh `exclude=expired` — current surface, not naming history |
 | `--dedupe-certs` | off | crt.sh `deduplicate=Y` |
 | `--siblings` | off | Keep out-of-scope SANs |
 | `--json` | off | Records with unicode, state, issuers, sources, hints |
 | `--raw` | off | First 25 raw crt.sh rows on stderr |
 | `--hints` | built-in list | Empty string disables |
+| `--user-agent` | Firefox/Linux | User-Agent header for all requests |
 | `--no-jitter` | off | Back-to-back backends (don't) |
 
 ---
 
 ## Query OPSEC
 
-Passive to the **target** is not passive to the **index**. crt.sh (Sectigo) and precert.ru store the query string against the source IP.
+Passive to the **target** is not passive to the **index**. crt.sh (Sectigo), precert.ru, and crt.name store the query string against the source IP.
 
 1. **User-Agent.** Old wrapper sent `IPTnWIT-ct-search/1.0 (class lab; +training)`. That is a course banner on 30 identical clients. certcreep sends a current Firefox/Linux UA. Do not put the course, the lab company, or “training” back in the header.
 2. **Source IP.** Until the shared Proton NL/CH/SG gateways ship, the request is the hypervisor NAT or the student’s hotel IP. After they ship, 30 Kalis still look like one Proton `/32`. That is acceptable for class; it is not invisibility. Check `ifconfig.co` before Lab 4. If it shows the Proxmox country, stop.
 3. **Query content is the collection event.** `q=%.superdrones.aero` is interest in that string. Practice queries on `yandex.ru` / `baidu.com` are camouflage-by-volume and expected. Real `supercam.aero` / staff domains stay forbidden. Organization search (`O=…`) is more identifying than a domain wildcard — it is not in this client.
-4. **Two backends, two jurisdictions.** crt.sh ≈ Chrome-log world. precert.ru ≈ Yandex Agate + VK NCA + Минцифры. Pick `--source` on purpose. Default `both` waits 1–3 s between them.
+4. **Three backends, separate operators.** crt.sh ≈ Chrome-log world. precert.ru ≈ Yandex Agate + VK NCA + Минцифры. crt.name ≈ a CT-derived subdomain index run by Defendio (EU). Pick `--source` on purpose. Default `both` (crt.sh + precert.ru) waits 1–3 s between them; `all` adds crt.name with the same jitter.
 5. **Burst.** Thirty Kalis hitting `yandex.ru` in the same second look like abuse and 502 the index. Stagger. A portal cache of the practice JSON (same pattern as `/research` for BDU) is the right next range change; it is not in this folder.
 6. **TLS persona.** Stock CPython `urllib`.
-7. **What this client will not do.** No CertSpotter + crt.name + Shodan CTL + Censys by default (more copies of the query). No live DNS. No Google Transparency Report scrape (browser fallback only).
+7. **What this client will not do.** No CertSpotter + Shodan CTL + Censys, and crt.name is not in the default `both` (more copies of the query); ask for it with `--source crtname` / `all`. No live DNS. No Google Transparency Report scrape (browser fallback only).
 
 ---
 
@@ -105,5 +122,5 @@ Passive to the **target** is not passive to the **index**. crt.sh (Sectigo) and 
 | Code | Meaning |
 |------|---------|
 | 0 | At least one index returned rows |
-| 2 | Both indexes failed; fallback URLs printed on stderr |
+| 2 | Every queried index failed; fallback URLs printed on stderr |
 
