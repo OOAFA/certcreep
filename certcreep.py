@@ -324,10 +324,10 @@ def main() -> int:
     p.add_argument("--limit", type=int, default=200, help="Max names to print (after last-seen sort)")
     p.add_argument(
         "--source",
-        choices=("crtsh", "precert", "crtname", "both", "all"),
+        choices=("crtsh", "precert", "crtname", "all"),
         default="all",
-        help="Which index to query: all = crt.sh + precert.ru + crt.name (default), "
-        "both = crt.sh + precert.ru, with jitter between them",
+        help="Which index to query: all = crt.sh + precert.ru + crt.name "
+        "(default, with jitter between them), or a single index",
     )
     p.add_argument("--exclude-expired", action="store_true", help="crt.sh exclude=expired")
     p.add_argument("--dedupe-certs", action="store_true", help="crt.sh deduplicate=Y")
@@ -353,9 +353,9 @@ def main() -> int:
     precert_rows: list[dict[str, Any]] = []
     crtname_rows: list[dict[str, Any]] = []
     sources_planned = []
-    if args.source in ("crtsh", "both", "all"):
+    if args.source in ("crtsh", "all"):
         sources_planned.append("crtsh")
-    if args.source in ("precert", "both", "all"):
+    if args.source in ("precert", "all"):
         sources_planned.append("precert")
     if args.source in ("crtname", "all"):
         sources_planned.append("crtname")
