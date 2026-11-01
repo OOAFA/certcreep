@@ -4,7 +4,7 @@
 Replaces ctfr.py
 
   * IDN-encodes Cyrillic / CJK apexes before the query
-  * Queries crt.sh JSON (apex + %.apex) and optionally precert.ru
+  * Queries crt.sh JSON (apex + %.apex), precert.ru and crt.name by default
   * Scopes names to the apex, keeps wildcard flags, emits A-label + U-label
   * Aggregates first/last seen and issuer set; classifies live / cooling / historical
   * Never resolves or connects to discovered hosts (read-only public logs)
@@ -32,6 +32,7 @@ UA = (
 )
 CRTSH = "https://crt.sh/"
 PRECERT = "https://precert.ru/results/ajax"
+CRTNAME = "https://crt.name/v1/search"
 GOOGLE_CT = "https://transparencyreport.google.com/https/certificates"
 TIMEOUT = 45
 RETRIES = 3
@@ -163,7 +164,7 @@ def in_scope(name: str, apex: str) -> bool:
     return False
 
 
-def request_json(url: str, user_agent: str = UA) -> Any:
+def request_json(url: str, user_agent: str = UA, no_retry: tuple[int, ...] = ()) -> Any:
     req = urllib.request.Request(
         url,
         headers={
@@ -184,6 +185,8 @@ def request_json(url: str, user_agent: str = UA) -> Any:
             return json.loads(text)
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as exc:
             last_exc = exc
+            if isinstance(exc, urllib.error.HTTPError) and exc.code in no_retry:
+                raise
             if attempt < RETRIES:
                 delay = min(8.0, 1.5 * attempt) + random.uniform(0.2, 1.0)
                 print(
@@ -216,6 +219,45 @@ def precert_json(query: str, user_agent: str = UA) -> list[dict[str, Any]]:
         rows = data.get("data") or data.get("rows") or data.get("results") or []
         return rows if isinstance(rows, list) else []
     return []
+
+
+def crtname_json(apex: str, user_agent: str = UA) -> list[dict[str, Any]]:
+    """crt.name /v1/search: one row per indexed name, (sub, first_seen) only.
+
+    apex must be an eTLD+1. A sub-apex (corp.example.ru) gets HTTP 400 naming
+    the eTLD+1; retry once with that and let the in-scope filter narrow it.
+    Free tier is 100 requests per IP per day, so 4xx is not retried.
+    """
+    no_retry = (400, 401, 403, 404, 429)
+
+    def fetch(q: str) -> Any:
+        params = urllib.parse.urlencode({"apex": q, "format": "json", "dates": 1})
+        return request_json(f"{CRTNAME}?{params}", user_agent, no_retry)
+
+    try:
+        data = fetch(apex)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 400:
+            raise
+        body = exc.read().decode("utf-8", errors="replace")
+        marker = "eTLD+1 is "
+        if marker not in body:
+            raise ValueError(f"HTTP 400: {body.strip()[:120]}") from exc
+        parent = body.split(marker, 1)[1].strip().rstrip(")").split()[0]
+        if not parent or parent == apex:
+            raise ValueError(f"HTTP 400: {body.strip()[:120]}") from exc
+        print(f"[*] crt.name wants the eTLD+1; query apex={parent}", file=sys.stderr)
+        data = fetch(parent)
+    rows: list[dict[str, Any]] = []
+    if not isinstance(data, list):
+        return rows
+    for item in data:
+        if not isinstance(item, dict) or not item.get("sub"):
+            continue
+        # first_seen is RFC 3339 with a trailing Z; parse_ts wants it bare.
+        seen = str(item.get("first_seen") or "").rstrip("Z")
+        rows.append({"name_value": str(item["sub"]), "entry_timestamp": seen})
+    return rows
 
 
 def ingest(
@@ -273,18 +315,48 @@ def hint_match(name: str, hints: list[str]) -> list[str]:
     return found
 
 
+SOURCES = ("crtsh", "precert", "crtname")
+
+
+def parse_sources(value: str) -> tuple[str, ...]:
+    """--source value: one index, a comma list (crtsh,precert), or all.
+
+    Case-insensitive, whitespace-trimmed, duplicates collapsed. "all" anywhere
+    in the list means every index. Query order is always crtsh, precert,
+    crtname regardless of the order given.
+    """
+    valid = ", ".join((*SOURCES, "all"))
+    picked: set[str] = set()
+    for part in str(value).split(","):
+        name = part.strip().lower()
+        if not name:
+            raise argparse.ArgumentTypeError(
+                f"empty entry in {value!r}; use a comma-separated list of: {valid}"
+            )
+        if name == "all":
+            picked.update(SOURCES)
+        elif name in SOURCES:
+            picked.add(name)
+        else:
+            raise argparse.ArgumentTypeError(f"unknown source {name!r}; choose from: {valid}")
+    return tuple(s for s in SOURCES if s in picked)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
-        description="CT name harvest via crt.sh + precert.ru (IDN-aware, scoped)"
+        description="CT name harvest via crt.sh + precert.ru + crt.name (IDN-aware, scoped)"
     )
     p.add_argument("-d", "--domain", required=True, help="Apex or IDN (yandex.ru, яндекс.рф, baidu.com)")
     p.add_argument("-o", "--output", help="Write unique in-scope A-labels, one per line")
     p.add_argument("--limit", type=int, default=200, help="Max names to print (after last-seen sort)")
     p.add_argument(
         "--source",
-        choices=("crtsh", "precert", "both"),
-        default="both",
-        help="Which index to query (default both, with jitter)",
+        type=parse_sources,
+        default="all",
+        metavar="SOURCES",
+        help="Index or comma-separated indexes to query: crtsh, precert, crtname, "
+        "or all (default) = crt.sh + precert.ru + crt.name. "
+        "Example: crtsh,precert. Jitter between indexes when more than one",
     )
     p.add_argument("--exclude-expired", action="store_true", help="crt.sh exclude=expired")
     p.add_argument("--dedupe-certs", action="store_true", help="crt.sh deduplicate=Y")
@@ -308,11 +380,8 @@ def main() -> int:
 
     crt_rows: list[dict[str, Any]] = []
     precert_rows: list[dict[str, Any]] = []
-    sources_planned = []
-    if args.source in ("crtsh", "both"):
-        sources_planned.append("crtsh")
-    if args.source in ("precert", "both"):
-        sources_planned.append("precert")
+    crtname_rows: list[dict[str, Any]] = []
+    sources_planned = list(args.source)
 
     for i, src in enumerate(sources_planned):
         if i and not args.no_jitter:
@@ -331,9 +400,12 @@ def main() -> int:
                             continue
                         seen_ids.add(rid)
                         crt_rows.append(row)
-            else:
+            elif src == "precert":
                 print(f"[*] query precert.ru  q={apex}", file=sys.stderr)
                 precert_rows = precert_json(apex, args.user_agent)
+            else:
+                print(f"[*] query crt.name  apex={apex}", file=sys.stderr)
+                crtname_rows = crtname_json(apex, args.user_agent)
         except urllib.error.HTTPError as exc:
             print(f"[!] {src} HTTP {exc.code}", file=sys.stderr)
         except Exception as exc:
@@ -342,6 +414,7 @@ def main() -> int:
     hits: dict[str, NameHit] = {}
     ingest(hits, crt_rows, apex, "crtsh", args.siblings)
     ingest(hits, precert_rows, apex, "precert", args.siblings)
+    ingest(hits, crtname_rows, apex, "crtname", args.siblings)
 
     scoped = [h for h in hits.values() if h.in_scope]
     siblings = [h for h in hits.values() if not h.in_scope]
@@ -349,6 +422,7 @@ def main() -> int:
 
     print(
         f"[+] {len(crt_rows)} crt.sh rows, {len(precert_rows)} precert.ru rows, "
+        f"{len(crtname_rows)} crt.name rows, "
         f"{len(scoped)} in-scope names, {len(siblings)} sibling SANs",
         file=sys.stderr,
     )
@@ -361,10 +435,11 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    if not crt_rows and not precert_rows:
+    if not crt_rows and not precert_rows and not crtname_rows:
         print(f"[!] Google CT: {GOOGLE_CT}", file=sys.stderr)
         print("[!] Fallbacks: https://precert.ru  (RU Yandex/VK/Mintsifry logs)", file=sys.stderr)
         print("[!]            https://crt.sh/?q=" + urllib.parse.quote(apex), file=sys.stderr)
+        print("[!]            https://crt.name/v1/search?apex=" + urllib.parse.quote(apex), file=sys.stderr)
         return 2
 
     shown = scoped[: args.limit]
