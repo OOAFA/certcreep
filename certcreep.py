@@ -315,6 +315,33 @@ def hint_match(name: str, hints: list[str]) -> list[str]:
     return found
 
 
+SOURCES = ("crtsh", "precert", "crtname")
+
+
+def parse_sources(value: str) -> tuple[str, ...]:
+    """--source value: one index, a comma list (crtsh,precert), or all.
+
+    Case-insensitive, whitespace-trimmed, duplicates collapsed. "all" anywhere
+    in the list means every index. Query order is always crtsh, precert,
+    crtname regardless of the order given.
+    """
+    valid = ", ".join((*SOURCES, "all"))
+    picked: set[str] = set()
+    for part in str(value).split(","):
+        name = part.strip().lower()
+        if not name:
+            raise argparse.ArgumentTypeError(
+                f"empty entry in {value!r}; use a comma-separated list of: {valid}"
+            )
+        if name == "all":
+            picked.update(SOURCES)
+        elif name in SOURCES:
+            picked.add(name)
+        else:
+            raise argparse.ArgumentTypeError(f"unknown source {name!r}; choose from: {valid}")
+    return tuple(s for s in SOURCES if s in picked)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description="CT name harvest via crt.sh + precert.ru + crt.name (IDN-aware, scoped)"
@@ -324,10 +351,12 @@ def main() -> int:
     p.add_argument("--limit", type=int, default=200, help="Max names to print (after last-seen sort)")
     p.add_argument(
         "--source",
-        choices=("crtsh", "precert", "crtname", "all"),
+        type=parse_sources,
         default="all",
-        help="Which index to query: all = crt.sh + precert.ru + crt.name "
-        "(default, with jitter between them), or a single index",
+        metavar="SOURCES",
+        help="Index or comma-separated indexes to query: crtsh, precert, crtname, "
+        "or all (default) = crt.sh + precert.ru + crt.name. "
+        "Example: crtsh,precert. Jitter between indexes when more than one",
     )
     p.add_argument("--exclude-expired", action="store_true", help="crt.sh exclude=expired")
     p.add_argument("--dedupe-certs", action="store_true", help="crt.sh deduplicate=Y")
@@ -352,13 +381,7 @@ def main() -> int:
     crt_rows: list[dict[str, Any]] = []
     precert_rows: list[dict[str, Any]] = []
     crtname_rows: list[dict[str, Any]] = []
-    sources_planned = []
-    if args.source in ("crtsh", "all"):
-        sources_planned.append("crtsh")
-    if args.source in ("precert", "all"):
-        sources_planned.append("precert")
-    if args.source in ("crtname", "all"):
-        sources_planned.append("crtname")
+    sources_planned = list(args.source)
 
     for i, src in enumerate(sources_planned):
         if i and not args.no_jitter:
