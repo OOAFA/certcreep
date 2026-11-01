@@ -4,7 +4,7 @@
 Replaces ctfr.py
 
   * IDN-encodes Cyrillic / CJK apexes before the query
-  * Queries crt.sh JSON (apex + %.apex) and optionally precert.ru / crt.name
+  * Queries crt.sh JSON (apex + %.apex), precert.ru and crt.name by default
   * Scopes names to the apex, keeps wildcard flags, emits A-label + U-label
   * Aggregates first/last seen and issuer set; classifies live / cooling / historical
   * Never resolves or connects to discovered hosts (read-only public logs)
@@ -325,9 +325,9 @@ def main() -> int:
     p.add_argument(
         "--source",
         choices=("crtsh", "precert", "crtname", "both", "all"),
-        default="both",
-        help="Which index to query: both = crt.sh + precert.ru (default), "
-        "all = crt.sh + precert.ru + crt.name, with jitter between them",
+        default="all",
+        help="Which index to query: all = crt.sh + precert.ru + crt.name (default), "
+        "both = crt.sh + precert.ru, with jitter between them",
     )
     p.add_argument("--exclude-expired", action="store_true", help="crt.sh exclude=expired")
     p.add_argument("--dedupe-certs", action="store_true", help="crt.sh deduplicate=Y")
