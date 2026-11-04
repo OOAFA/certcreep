@@ -28,6 +28,7 @@ Why this exists:
 - Jitter between backends and between apexes in a file; 3 attempts on 502 / HTML-as-JSON
 - Batch apexes from a file (`-iL` / `--input-file`, or `-` for stdin); `-d` and `-iL` are mutually exclusive
 - Optional A-record resolve (`--resolve`) with a stdlib DNS client; `--nameserver` picks the resolvers (implies `--resolve`)
+- Live `-o` writing as each apex finishes (text/CSV append+flush; JSON atomic rewrite); optional `--csv` output
 - Stdlib only (`python3`), no pip
 
 `--json` is the record format. Default stdout is still one name per line so it pipes into the rest of S4.
@@ -84,6 +85,16 @@ python3 certcreep.py -d sqlite.org --source crtname --limit 20 --nameserver 77.8
 Stderr is the operator view (counts, states, hinted names, resolve summary). Stdout / `-o` is the list.
 With `-iL` and more than one apex, text lines are `apex\tname` (plus `\tIPs` when resolving); JSON records carry an `apex` field.
 
+### Live output
+
+Results are written **as each apex finishes** (after its CT queries and optional `--resolve`), not once at the end:
+
+- **Text** (`-o` or stdout): lines are appended and flushed. `tail -f outfile.txt` shows names appear between apexes.
+- **CSV** (`--csv`, with or without `-o`): header row first, then one row per name appended and flushed after each apex (`tail -f` friendly). Columns: `apex`, `name`, `unicode`, `wildcard`, `state`, `first_seen`, `last_seen`, `not_after`, `issuers`, `sources`, `hints`, plus `a_records` / `dns_status` when `--resolve`. Multi-value fields are joined with `;`. `--csv` and `--json` are mutually exclusive.
+- **JSON + `-o`**: the file stays a single JSON array. After each apex the whole array is rewritten via a temp file + `os.replace`, so the file is always valid JSON (including `[]` before the first apex). A crash or Ctrl-C leaves the last successful rewrite.
+- **JSON without `-o`**: one array is printed to stdout when the run ends (pipes still get valid JSON).
+- Within an apex, names are still merged/deduped across sources before anything is written; each apex is emitted once.
+
 If every queried index fails:
 
 1. Browser: `https://crt.sh/?q=<apex>` via LibreWolf with the S3 `rus` / `chn` profile
@@ -108,13 +119,14 @@ If every queried index fails:
 |------|---------|--------|
 | `-d / --domain` | one of `-d` / `-iL` required | Apex or IDN |
 | `-iL / --input-file` | one of `-d` / `-iL` required | File of apexes (one per line; `#` and blanks skipped; deduped). `-` reads stdin. Mutually exclusive with `-d` |
-| `-o / --output` | stdout | Write the list / JSON |
+| `-o / --output` | stdout | Live write: text/CSV append+flush after each apex; JSON array rewritten atomically after each apex |
 | `--limit` | 200 | Applied **after** last-seen sort, **per apex** |
 | `--source` | `all` | `crtsh` \| `precert` \| `crtname` \| `all` (crt.sh + precert.ru + crt.name), or a comma-separated list such as `crtsh,precert`. Case-insensitive; spaces and duplicates ignored; `all` anywhere in the list means every index. Unknown or empty entries are an error. Query order is always crt.sh → precert.ru → crt.name |
 | `--exclude-expired` | off | crt.sh `exclude=expired` — current surface, not naming history |
 | `--dedupe-certs` | off | crt.sh `deduplicate=Y` |
 | `--siblings` | off | Keep out-of-scope SANs |
-| `--json` | off | Records with unicode, state, issuers, sources, hints |
+| `--json` | off | Records with unicode, state, issuers, sources, hints (and `a_records` / `dns_status` with `--resolve`). With `-o`, rewritten after each apex; without `-o`, one array at exit. Mutually exclusive with `--csv` |
+| `--csv` | off | CSV with header; columns match JSON fields (`apex` always present; multi-values joined with `;`). Append+flush after each apex. Mutually exclusive with `--json` |
 | `--raw` | off | First 25 raw crt.sh rows on stderr |
 | `--hints` | built-in list | Empty string disables |
 | `--user-agent` | Firefox/Linux | User-Agent header for all requests |

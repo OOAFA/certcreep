@@ -15,13 +15,16 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import csv
 import ipaddress
 import json
+import os
 import random
 import socket
 import ssl
 import struct
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -765,6 +768,156 @@ def format_text_line(h: NameHit, include_dns: bool, multi: bool, apex: str) -> s
     return name
 
 
+def csv_fieldnames(include_dns: bool) -> list[str]:
+    fields = [
+        "apex",
+        "name",
+        "unicode",
+        "wildcard",
+        "state",
+        "first_seen",
+        "last_seen",
+        "not_after",
+        "issuers",
+        "sources",
+        "hints",
+    ]
+    if include_dns:
+        fields.extend(["a_records", "dns_status"])
+    return fields
+
+
+def hit_to_csv_row(
+    h: NameHit,
+    hints: list[str],
+    include_dns: bool,
+    apex: str,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "apex": apex,
+        "name": h.a_label,
+        "unicode": h.u_label,
+        "wildcard": "1" if h.wildcard else "0",
+        "state": h.state,
+        "first_seen": h.first_seen,
+        "last_seen": h.last_seen,
+        "not_after": h.not_after,
+        "issuers": ";".join(sorted(h.issuers)),
+        "sources": ";".join(sorted(h.sources)),
+        "hints": ";".join(hint_match(h.a_label, hints)),
+    }
+    if include_dns:
+        row["a_records"] = ";".join(h.a_records)
+        row["dns_status"] = h.dns_status
+    return row
+
+
+class LiveOutput:
+    """Stream results as each apex finishes.
+
+    Text/CSV: append rows and flush (works with tail -f). JSON: keep the array
+    format and rewrite the whole file atomically after each apex so the file
+    is always valid JSON. JSON without -o is still emitted once at close.
+    """
+
+    def __init__(self, path: str | None, kind: str, include_dns: bool = False) -> None:
+        if kind not in ("text", "json", "csv"):
+            raise ValueError(f"unknown output kind {kind!r}")
+        self.path = path
+        self.kind = kind
+        self.include_dns = include_dns
+        self.payload: list[Any] = []
+        self.records = 0
+        self._fields = csv_fieldnames(include_dns)
+        if kind == "json":
+            if path:
+                self._atomic_write("[]\n")
+            return
+        if path:
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                if kind == "csv":
+                    csv.DictWriter(fh, fieldnames=self._fields).writeheader()
+                    fh.flush()
+                    os.fsync(fh.fileno())
+        elif kind == "csv":
+            csv.DictWriter(sys.stdout, fieldnames=self._fields, lineterminator="\n").writeheader()
+            sys.stdout.flush()
+
+    def _append_text(self, block: str) -> None:
+        if self.path:
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write(block)
+                fh.flush()
+                os.fsync(fh.fileno())
+        else:
+            sys.stdout.write(block)
+            sys.stdout.flush()
+
+    def add_text(self, lines: list[str]) -> None:
+        if not lines:
+            return
+        block = "\n".join(lines) + "\n"
+        self.records += len(lines)
+        self._append_text(block)
+        if self.path:
+            print(f"[+] wrote {self.records} lines -> {self.path}", file=sys.stderr)
+
+    def add_csv(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        if self.path:
+            with open(self.path, "a", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=self._fields, extrasaction="ignore")
+                for row in rows:
+                    writer.writerow(row)
+                fh.flush()
+                os.fsync(fh.fileno())
+        else:
+            writer = csv.DictWriter(
+                sys.stdout, fieldnames=self._fields, extrasaction="ignore", lineterminator="\n"
+            )
+            for row in rows:
+                writer.writerow(row)
+            sys.stdout.flush()
+        self.records += len(rows)
+        if self.path:
+            print(f"[+] wrote {self.records} CSV rows -> {self.path}", file=sys.stderr)
+
+    def add_json(self, records: list[Any]) -> None:
+        if not records:
+            if self.path:
+                self._atomic_write(json.dumps(self.payload, ensure_ascii=False, indent=2) + "\n")
+            return
+        self.payload.extend(records)
+        self.records = len(self.payload)
+        body = json.dumps(self.payload, ensure_ascii=False, indent=2) + "\n"
+        if self.path:
+            self._atomic_write(body)
+            print(f"[+] wrote {self.records} JSON records -> {self.path}", file=sys.stderr)
+
+    def _atomic_write(self, body: str) -> None:
+        assert self.path
+        directory = os.path.dirname(os.path.abspath(self.path)) or "."
+        fd, tmp = tempfile.mkstemp(prefix=".certcreep-", suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(body)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def close(self) -> None:
+        if self.kind == "json" and not self.path:
+            sys.stdout.write(json.dumps(self.payload, ensure_ascii=False, indent=2) + "\n")
+            sys.stdout.flush()
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description="CT name harvest via crt.sh + precert.ru + crt.name (IDN-aware, scoped)"
@@ -777,7 +930,12 @@ def main() -> int:
         metavar="FILE",
         help="File of apexes, one per line (# and blanks skipped); '-' reads stdin",
     )
-    p.add_argument("-o", "--output", help="Write unique in-scope A-labels, one per line")
+    p.add_argument(
+        "-o",
+        "--output",
+        help="Write results live as each apex finishes (text/CSV append+flush; "
+        "JSON rewritten atomically after each apex). Use tail -f on text/CSV files",
+    )
     p.add_argument("--limit", type=int, default=200, help="Max names to print per apex (after last-seen sort)")
     p.add_argument(
         "--source",
@@ -791,7 +949,20 @@ def main() -> int:
     p.add_argument("--exclude-expired", action="store_true", help="crt.sh exclude=expired")
     p.add_argument("--dedupe-certs", action="store_true", help="crt.sh deduplicate=Y")
     p.add_argument("--siblings", action="store_true", help="Also keep out-of-scope SANs from the same certs")
-    p.add_argument("--json", action="store_true", help="JSON records instead of a name list")
+    fmt = p.add_mutually_exclusive_group()
+    fmt.add_argument(
+        "--json",
+        action="store_true",
+        help="JSON records instead of a name list. With -o the file is a JSON array "
+        "rewritten after each apex (always valid). Without -o, one array is printed at the end",
+    )
+    fmt.add_argument(
+        "--csv",
+        action="store_true",
+        help="CSV records with a header row (stdlib csv). Columns match JSON fields; "
+        "multi-value fields use ';'. Appended and flushed after each apex "
+        "(tail -f friendly). Mutually exclusive with --json",
+    )
     p.add_argument("--raw", action="store_true", help="Dump a few raw crt.sh rows to stderr")
     p.add_argument(
         "--hints",
@@ -817,6 +988,13 @@ def main() -> int:
     if args.nameserver and not args.resolve:
         args.resolve = True
 
+    if args.json:
+        kind = "json"
+    elif args.csv:
+        kind = "csv"
+    else:
+        kind = "text"
+
     hints = [h.strip() for h in args.hints.split(",") if h.strip()] if args.hints else []
     if args.input_file is not None:
         domains = load_domains(args.input_file)
@@ -824,78 +1002,83 @@ def main() -> int:
         domains = [args.domain]
 
     multi = len(domains) > 1
-    nameservers = args.nameserver  # None or list[str]
-    all_payload: list[Any] = []
-    text_lines: list[str] = []
+    nameservers = args.nameserver
+    out = LiveOutput(args.output, kind, include_dns=args.resolve)
     any_ok = False
     any_fail = False
 
-    for di, domain in enumerate(domains):
-        if di and not args.no_jitter:
-            delay = random.uniform(1.0, 3.0)
-            print(f"[*] jitter {delay:.1f}s before next apex", file=sys.stderr)
-            time.sleep(delay)
-        try:
-            shown, siblings, status = harvest_one(
-                domain,
-                args.source,
-                exclude_expired=args.exclude_expired,
-                dedupe_certs=args.dedupe_certs,
-                siblings=args.siblings,
-                user_agent=args.user_agent,
-                no_jitter=args.no_jitter,
-                limit=args.limit,
-                hints=hints,
-                raw=args.raw,
-                do_resolve=args.resolve,
-                nameservers=nameservers,
-            )
-        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
-            print(f"[!] apex {domain} aborted: {exc}", file=sys.stderr)
-            any_fail = True
-            continue
-        apex = to_ascii_domain(domain)
-        if status == 0:
-            any_ok = True
-        else:
-            any_fail = True
-        if args.json:
-            for h in shown:
-                all_payload.append(hit_to_json(h, hints, args.resolve, apex if multi else None))
-            if args.siblings and siblings:
-                sib_block: dict[str, Any] = {
-                    "_siblings": [
-                        {
-                            "name": s.a_label,
-                            "unicode": s.u_label,
-                            "wildcard": s.wildcard,
-                            **(
-                                {"a_records": list(s.a_records), "dns_status": s.dns_status}
-                                if args.resolve
-                                else {}
-                            ),
-                        }
-                        for s in siblings
-                    ]
-                }
-                if multi:
-                    sib_block["apex"] = apex
-                all_payload.append(sib_block)
-        else:
-            for h in shown:
-                text_lines.append(format_text_line(h, args.resolve, multi, apex))
-
-    if args.json:
-        text = json.dumps(all_payload, ensure_ascii=False, indent=2) + "\n"
-    else:
-        text = "\n".join(text_lines) + ("\n" if text_lines else "")
-
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        print(f"[+] wrote {args.output}", file=sys.stderr)
-    else:
-        sys.stdout.write(text)
+    try:
+        for di, domain in enumerate(domains):
+            if di and not args.no_jitter:
+                delay = random.uniform(1.0, 3.0)
+                print(f"[*] jitter {delay:.1f}s before next apex", file=sys.stderr)
+                time.sleep(delay)
+            try:
+                shown, siblings, status = harvest_one(
+                    domain,
+                    args.source,
+                    exclude_expired=args.exclude_expired,
+                    dedupe_certs=args.dedupe_certs,
+                    siblings=args.siblings,
+                    user_agent=args.user_agent,
+                    no_jitter=args.no_jitter,
+                    limit=args.limit,
+                    hints=hints,
+                    raw=args.raw,
+                    do_resolve=args.resolve,
+                    nameservers=nameservers,
+                )
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+                print(f"[!] apex {domain} aborted: {exc}", file=sys.stderr)
+                any_fail = True
+                continue
+            apex = to_ascii_domain(domain)
+            if status == 0:
+                any_ok = True
+            else:
+                any_fail = True
+            # Emit only after this apex's sources (+ optional resolve) finished.
+            # Per-apex ingest already dedupes names; each apex is written once.
+            if kind == "json":
+                batch: list[Any] = [
+                    hit_to_json(h, hints, args.resolve, apex if multi else None) for h in shown
+                ]
+                if args.siblings and siblings:
+                    sib_block: dict[str, Any] = {
+                        "_siblings": [
+                            {
+                                "name": s.a_label,
+                                "unicode": s.u_label,
+                                "wildcard": s.wildcard,
+                                **(
+                                    {
+                                        "a_records": list(s.a_records),
+                                        "dns_status": s.dns_status,
+                                    }
+                                    if args.resolve
+                                    else {}
+                                ),
+                            }
+                            for s in siblings
+                        ]
+                    }
+                    if multi:
+                        sib_block["apex"] = apex
+                    batch.append(sib_block)
+                out.add_json(batch)
+            elif kind == "csv":
+                out.add_csv(
+                    [hit_to_csv_row(h, hints, args.resolve, apex) for h in shown]
+                )
+            else:
+                out.add_text(
+                    [format_text_line(h, args.resolve, multi, apex) for h in shown]
+                )
+    except KeyboardInterrupt:
+        print("[!] interrupted; keeping results written so far", file=sys.stderr)
+        any_fail = True
+    finally:
+        out.close()
 
     if any_ok and not any_fail:
         return 0
