@@ -7,15 +7,20 @@ Replaces ctfr.py
   * Queries crt.sh JSON (apex + %.apex), precert.ru and crt.name by default
   * Scopes names to the apex, keeps wildcard flags, emits A-label + U-label
   * Aggregates first/last seen and issuer set; classifies live / cooling / historical
-  * Never resolves or connects to discovered hosts (read-only public logs)
+  * Optional domain list (-iL) for batch apexes
+  * Optional A-record resolve (--resolve / --nameserver); off by default so CT queries stay passive to the target
 
 """
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import ipaddress
 import json
 import random
+import socket
 import ssl
+import struct
 import sys
 import time
 import urllib.error
@@ -37,6 +42,8 @@ GOOGLE_CT = "https://transparencyreport.google.com/https/certificates"
 TIMEOUT = 45
 RETRIES = 3
 COOLING_DAYS = 90
+DNS_TIMEOUT = 3.0
+DNS_WORKERS = 16
 
 
 @dataclass
@@ -50,6 +57,8 @@ class NameHit:
     issuers: set[str] = field(default_factory=set)
     sources: set[str] = field(default_factory=set)
     in_scope: bool = True
+    a_records: list[str] = field(default_factory=list)
+    dns_status: str = ""
 
     @property
     def state(self) -> str:
@@ -315,6 +324,247 @@ def hint_match(name: str, hints: list[str]) -> list[str]:
     return found
 
 
+def load_domains(path: str) -> list[str]:
+    """Read apexes from a file (or '-' for stdin). Blank / # lines skipped; order kept, deduped."""
+    if path == "-":
+        raw = sys.stdin.read().splitlines()
+    else:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                raw = fh.read().splitlines()
+        except OSError as exc:
+            raise SystemExit(f"[!] cannot read {path}: {exc}") from exc
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in raw:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line in seen:
+            continue
+        seen.add(line)
+        out.append(line)
+    if not out:
+        raise SystemExit(f"[!] no domains in {path}")
+    return out
+
+
+def parse_nameservers(value: str) -> list[str]:
+    """Comma-separated IPv4/IPv6 nameserver list for --nameserver."""
+    out: list[str] = []
+    for part in str(value).split(","):
+        token = part.strip()
+        if not token:
+            raise argparse.ArgumentTypeError(
+                f"empty entry in {value!r}; use comma-separated IPv4/IPv6 addresses"
+            )
+        try:
+            out.append(str(ipaddress.ip_address(token)))
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"invalid nameserver {token!r}; need an IPv4 or IPv6 address"
+            ) from exc
+    if not out:
+        raise argparse.ArgumentTypeError("nameserver list is empty")
+    return out
+
+
+def _encode_qname(name: str) -> bytes:
+    parts = name.rstrip(".").split(".")
+    out = bytearray()
+    for label in parts:
+        raw = label.encode("ascii")
+        if not raw or len(raw) > 63:
+            raise ValueError(f"bad DNS label in {name!r}")
+        out.append(len(raw))
+        out.extend(raw)
+    out.append(0)
+    return bytes(out)
+
+
+def _skip_name(buf: bytes, offset: int) -> int:
+    while True:
+        if offset >= len(buf):
+            raise ValueError("truncated DNS name")
+        length = buf[offset]
+        if length & 0xC0 == 0xC0:
+            if offset + 1 >= len(buf):
+                raise ValueError("truncated DNS pointer")
+            return offset + 2
+        if length == 0:
+            return offset + 1
+        offset += 1 + length
+
+
+def _parse_a_answers(buf: bytes) -> tuple[int, list[str]]:
+    if len(buf) < 12:
+        raise ValueError("short DNS reply")
+    rcode = buf[3] & 0x0F
+    ancount = struct.unpack("!H", buf[6:8])[0]
+    offset = 12
+    offset = _skip_name(buf, offset)
+    offset += 4  # qtype + qclass
+    addrs: list[str] = []
+    for _ in range(ancount):
+        offset = _skip_name(buf, offset)
+        if offset + 10 > len(buf):
+            raise ValueError("truncated DNS answer")
+        rtype, rclass, _ttl, rdlen = struct.unpack("!HHIH", buf[offset : offset + 10])
+        offset += 10
+        rdata = buf[offset : offset + rdlen]
+        offset += rdlen
+        if rtype == 1 and rclass == 1 and rdlen == 4:
+            addrs.append(socket.inet_ntoa(rdata))
+    return rcode, addrs
+
+
+def _dns_query_tcp(name: str, nameserver: str, timeout: float) -> tuple[int, list[str]]:
+    qid = random.randint(0, 0xFFFF)
+    header = struct.pack("!HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+    question = _encode_qname(name) + struct.pack("!HH", 1, 1)
+    packet = header + question
+    family = socket.AF_INET6 if ":" in nameserver else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        sock.connect((nameserver, 53))
+        sock.sendall(struct.pack("!H", len(packet)) + packet)
+        length_raw = sock.recv(2)
+        if len(length_raw) < 2:
+            raise ValueError("short DNS TCP length")
+        (need,) = struct.unpack("!H", length_raw)
+        chunks = bytearray()
+        while len(chunks) < need:
+            piece = sock.recv(need - len(chunks))
+            if not piece:
+                raise ValueError("short DNS TCP body")
+            chunks.extend(piece)
+    data = bytes(chunks)
+    if len(data) < 12 or struct.unpack("!H", data[:2])[0] != qid:
+        raise ValueError("DNS reply id mismatch")
+    return _parse_a_answers(data)
+
+
+def resolve_a_system(name: str, timeout: float = DNS_TIMEOUT) -> tuple[list[str], str]:
+    """A records via the system resolver (getaddrinfo, AF_INET only).
+
+    Timeout is enforced with a one-shot worker thread so we never touch the
+    process-global socket.setdefaulttimeout (unsafe under the resolve pool).
+    """
+    def _lookup() -> list[str]:
+        infos = socket.getaddrinfo(name, None, socket.AF_INET, socket.SOCK_STREAM)
+        return sorted({info[4][0] for info in infos})
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            addrs = pool.submit(_lookup).result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        return [], "timeout"
+    except socket.gaierror as exc:
+        msg = str(exc).lower()
+        if "name or service not known" in msg or "nodename nor servname" in msg or "not found" in msg:
+            return [], "nxdomain"
+        if "temporary failure" in msg or "try again" in msg:
+            return [], "servfail"
+        return [], f"error:{exc}"
+    except OSError as exc:
+        return [], f"error:{exc}"
+    if not addrs:
+        return [], "noanswer"
+    return addrs, "ok"
+
+
+def _dns_exchange(name: str, nameserver: str, timeout: float) -> tuple[int, list[str]]:
+    """UDP A query; fall back to TCP when the truncation bit is set."""
+    qid = random.randint(0, 0xFFFF)
+    header = struct.pack("!HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+    question = _encode_qname(name) + struct.pack("!HH", 1, 1)
+    packet = header + question
+    family = socket.AF_INET6 if ":" in nameserver else socket.AF_INET
+    with socket.socket(family, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(timeout)
+        sock.sendto(packet, (nameserver, 53))
+        data, _ = sock.recvfrom(4096)
+    if len(data) < 12 or struct.unpack("!H", data[:2])[0] != qid:
+        raise ValueError("DNS reply id mismatch")
+    truncated = bool(data[2] & 0x02)
+    if truncated:
+        return _dns_query_tcp(name, nameserver, timeout)
+    return _parse_a_answers(data)
+
+
+def _interpret_a_reply(rcode: int, addrs: list[str]) -> tuple[list[str], str] | None:
+    """Map rcode/addrs to a final result, or None to try the next nameserver."""
+    if rcode == 3:
+        return [], "nxdomain"
+    if rcode == 2:
+        return None  # SERVFAIL — try next NS
+    if rcode != 0 and not addrs:
+        return None
+    if addrs:
+        return sorted(set(addrs)), "ok"
+    return [], "noanswer"
+
+
+def resolve_a_custom(
+    name: str,
+    nameservers: list[str],
+    timeout: float = DNS_TIMEOUT,
+) -> tuple[list[str], str]:
+    """A records via UDP (TCP on truncation or UDP failure) against an ordered NS list."""
+    last_status = "error"
+    for ns in nameservers:
+        try:
+            result = _interpret_a_reply(*_dns_exchange(name, ns, timeout))
+            if result is None:
+                last_status = "servfail"
+                continue
+            return result
+        except TimeoutError:
+            last_status = "timeout"
+        except (OSError, ValueError, struct.error) as exc:
+            last_status = f"error:{exc}"
+        # UDP blocked or broken — try TCP against the same NS before moving on.
+        try:
+            result = _interpret_a_reply(*_dns_query_tcp(name, ns, timeout))
+            if result is None:
+                last_status = "servfail"
+                continue
+            return result
+        except TimeoutError:
+            last_status = "timeout"
+        except (OSError, ValueError, struct.error) as exc:
+            last_status = f"error:{exc}"
+    return [], last_status
+
+
+def resolve_hits(
+    hits: list[NameHit],
+    nameservers: list[str] | None,
+    workers: int = DNS_WORKERS,
+    timeout: float = DNS_TIMEOUT,
+) -> None:
+    """Fill a_records / dns_status on each hit. Wildcards are skipped (no lookup)."""
+    targets = [h for h in hits if not h.wildcard]
+    for h in hits:
+        if h.wildcard:
+            h.dns_status = "skipped:wildcard"
+            h.a_records = []
+
+    def one(h: NameHit) -> tuple[NameHit, list[str], str]:
+        if nameservers:
+            addrs, status = resolve_a_custom(h.a_label, nameservers, timeout)
+        else:
+            addrs, status = resolve_a_system(h.a_label, timeout)
+        return h, addrs, status
+
+    if not targets:
+        return
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, len(targets)))) as pool:
+        for h, addrs, status in pool.map(one, targets):
+            h.a_records = addrs
+            h.dns_status = status
+
+
 SOURCES = ("crtsh", "precert", "crtname")
 
 
@@ -342,13 +592,193 @@ def parse_sources(value: str) -> tuple[str, ...]:
     return tuple(s for s in SOURCES if s in picked)
 
 
+def harvest_one(
+    apex_raw: str,
+    sources: tuple[str, ...],
+    *,
+    exclude_expired: bool,
+    dedupe_certs: bool,
+    siblings: bool,
+    user_agent: str,
+    no_jitter: bool,
+    limit: int,
+    hints: list[str],
+    raw: bool,
+    do_resolve: bool,
+    nameservers: list[str] | None,
+) -> tuple[list[NameHit], list[NameHit], int]:
+    """Query indexes for one apex. Returns (scoped_shown, siblings, status).
+
+    status: 0 = at least one index returned rows, 2 = every index failed.
+    """
+    apex = to_ascii_domain(apex_raw)
+    u_apex = to_unicode_domain(apex)
+    print(f"[*] apex {apex}" + (f" ({u_apex})" if u_apex != apex else ""), file=sys.stderr)
+
+    crt_rows: list[dict[str, Any]] = []
+    precert_rows: list[dict[str, Any]] = []
+    crtname_rows: list[dict[str, Any]] = []
+    sources_planned = list(sources)
+
+    for i, src in enumerate(sources_planned):
+        if i and not no_jitter:
+            delay = random.uniform(1.0, 3.0)
+            print(f"[*] jitter {delay:.1f}s before {src}", file=sys.stderr)
+            time.sleep(delay)
+        try:
+            if src == "crtsh":
+                print(f"[*] query crt.sh  q={apex} and q=%.{apex}", file=sys.stderr)
+                seen_ids: set[Any] = set()
+                for q in (apex, f"%.{apex}"):
+                    batch = crtsh_json(q, exclude_expired, dedupe_certs, user_agent)
+                    for row in batch:
+                        rid = row.get("id") or row.get("min_cert_id") or id(row)
+                        if rid in seen_ids:
+                            continue
+                        seen_ids.add(rid)
+                        crt_rows.append(row)
+            elif src == "precert":
+                print(f"[*] query precert.ru  q={apex}", file=sys.stderr)
+                precert_rows = precert_json(apex, user_agent)
+            else:
+                print(f"[*] query crt.name  apex={apex}", file=sys.stderr)
+                crtname_rows = crtname_json(apex, user_agent)
+        except urllib.error.HTTPError as exc:
+            print(f"[!] {src} HTTP {exc.code}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[!] {src} failed: {exc}", file=sys.stderr)
+
+    hits: dict[str, NameHit] = {}
+    ingest(hits, crt_rows, apex, "crtsh", siblings)
+    ingest(hits, precert_rows, apex, "precert", siblings)
+    ingest(hits, crtname_rows, apex, "crtname", siblings)
+
+    scoped = [h for h in hits.values() if h.in_scope]
+    sibling_hits = [h for h in hits.values() if not h.in_scope]
+    scoped.sort(
+        key=lambda h: (
+            parse_ts(h.last_seen) or datetime.min.replace(tzinfo=timezone.utc),
+            h.a_label,
+        ),
+        reverse=True,
+    )
+
+    print(
+        f"[+] {len(crt_rows)} crt.sh rows, {len(precert_rows)} precert.ru rows, "
+        f"{len(crtname_rows)} crt.name rows, "
+        f"{len(scoped)} in-scope names, {len(sibling_hits)} sibling SANs",
+        file=sys.stderr,
+    )
+    by_state: dict[str, int] = {}
+    for h in scoped:
+        by_state[h.state] = by_state.get(h.state, 0) + 1
+    if by_state:
+        print(
+            "[+] states  " + ", ".join(f"{k}={v}" for k, v in sorted(by_state.items())),
+            file=sys.stderr,
+        )
+
+    if not crt_rows and not precert_rows and not crtname_rows:
+        print(f"[!] Google CT: {GOOGLE_CT}", file=sys.stderr)
+        print("[!] Fallbacks: https://precert.ru  (RU Yandex/VK/Mintsifry logs)", file=sys.stderr)
+        print("[!]            https://crt.sh/?q=" + urllib.parse.quote(apex), file=sys.stderr)
+        print("[!]            https://crt.name/v1/search?apex=" + urllib.parse.quote(apex), file=sys.stderr)
+        return [], sibling_hits, 2
+
+    shown = scoped[:limit]
+    flagged = []
+    for h in shown:
+        marks = hint_match(h.a_label, hints)
+        if marks:
+            flagged.append((h, marks))
+    if flagged:
+        print("[+] hinted names:", file=sys.stderr)
+        for h, marks in flagged[:25]:
+            label = h.a_label if h.u_label == h.a_label else f"{h.a_label} ({h.u_label})"
+            wild = " *." if h.wildcard else "    "
+            print(f"    {wild}{label}  [{h.state}]  {','.join(marks)}", file=sys.stderr)
+
+    if do_resolve:
+        print(f"[*] resolve A records for {len(shown)} names", file=sys.stderr)
+        resolve_hits(shown, nameservers)
+        if siblings:
+            resolve_hits(sibling_hits, nameservers)
+        ok = sum(1 for h in shown if h.dns_status == "ok")
+        print(
+            f"[+] resolve  ok={ok}  "
+            + ", ".join(
+                f"{k}={v}"
+                for k, v in sorted(
+                    {
+                        s: sum(1 for h in shown if h.dns_status == s)
+                        for s in {h.dns_status for h in shown}
+                        if s != "ok"
+                    }.items()
+                )
+            ),
+            file=sys.stderr,
+        )
+
+    if raw:
+        for row in crt_rows[:25]:
+            print(
+                f"    {row.get('not_before', '')}  "
+                f"{str(row.get('issuer_name', ''))[:60]}  "
+                f"{str(row.get('name_value', ''))[:80]}",
+                file=sys.stderr,
+            )
+    return shown, sibling_hits, 0
+
+
+def hit_to_json(h: NameHit, hints: list[str], include_dns: bool, apex: str | None = None) -> dict[str, Any]:
+    rec: dict[str, Any] = {
+        "name": h.a_label,
+        "unicode": h.u_label,
+        "wildcard": h.wildcard,
+        "state": h.state,
+        "first_seen": h.first_seen,
+        "last_seen": h.last_seen,
+        "not_after": h.not_after,
+        "issuers": sorted(h.issuers),
+        "sources": sorted(h.sources),
+        "hints": hint_match(h.a_label, hints),
+    }
+    if apex is not None:
+        rec["apex"] = apex
+    if include_dns:
+        rec["a_records"] = list(h.a_records)
+        rec["dns_status"] = h.dns_status
+    return rec
+
+
+def format_text_line(h: NameHit, include_dns: bool, multi: bool, apex: str) -> str:
+    name = h.a_label
+    if h.wildcard:
+        name = "*." + name
+    if multi:
+        name = f"{apex}\t{name}"
+    if include_dns:
+        if h.dns_status == "ok" and h.a_records:
+            name = f"{name}\t{','.join(h.a_records)}"
+        else:
+            name = f"{name}\t[{h.dns_status or 'unresolved'}]"
+    return name
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description="CT name harvest via crt.sh + precert.ru + crt.name (IDN-aware, scoped)"
     )
-    p.add_argument("-d", "--domain", required=True, help="Apex or IDN (yandex.ru, яндекс.рф, baidu.com)")
+    target = p.add_mutually_exclusive_group(required=True)
+    target.add_argument("-d", "--domain", help="Apex or IDN (yandex.ru, яндекс.рф, baidu.com)")
+    target.add_argument(
+        "-iL",
+        "--input-file",
+        metavar="FILE",
+        help="File of apexes, one per line (# and blanks skipped); '-' reads stdin",
+    )
     p.add_argument("-o", "--output", help="Write unique in-scope A-labels, one per line")
-    p.add_argument("--limit", type=int, default=200, help="Max names to print (after last-seen sort)")
+    p.add_argument("--limit", type=int, default=200, help="Max names to print per apex (after last-seen sort)")
     p.add_argument(
         "--source",
         type=parse_sources,
@@ -369,127 +799,96 @@ def main() -> int:
         help="Comma-separated tokens to flag on stderr (empty to disable)",
     )
     p.add_argument("--user-agent", default=UA, help="User-Agent header for all requests")
-    p.add_argument("--no-jitter", action="store_true", help="Do not sleep between backends")
+    p.add_argument("--no-jitter", action="store_true", help="Do not sleep between backends or between apexes")
+    p.add_argument(
+        "--resolve",
+        action="store_true",
+        help="Resolve A records for discovered names (system resolver unless --nameserver)",
+    )
+    p.add_argument(
+        "--nameserver",
+        type=parse_nameservers,
+        metavar="IPS",
+        help="Comma-separated IPv4/IPv6 nameservers for --resolve "
+        "(implies --resolve). Tried in order on failure. Example: 77.88.8.8,9.9.9.9",
+    )
     args = p.parse_args()
 
-    apex = to_ascii_domain(args.domain)
-    u_apex = to_unicode_domain(apex)
+    if args.nameserver and not args.resolve:
+        args.resolve = True
+
     hints = [h.strip() for h in args.hints.split(",") if h.strip()] if args.hints else []
+    if args.input_file is not None:
+        domains = load_domains(args.input_file)
+    else:
+        domains = [args.domain]
 
-    print(f"[*] apex {apex}" + (f" ({u_apex})" if u_apex != apex else ""), file=sys.stderr)
+    multi = len(domains) > 1
+    nameservers = args.nameserver  # None or list[str]
+    all_payload: list[Any] = []
+    text_lines: list[str] = []
+    any_ok = False
+    any_fail = False
 
-    crt_rows: list[dict[str, Any]] = []
-    precert_rows: list[dict[str, Any]] = []
-    crtname_rows: list[dict[str, Any]] = []
-    sources_planned = list(args.source)
-
-    for i, src in enumerate(sources_planned):
-        if i and not args.no_jitter:
+    for di, domain in enumerate(domains):
+        if di and not args.no_jitter:
             delay = random.uniform(1.0, 3.0)
-            print(f"[*] jitter {delay:.1f}s before {src}", file=sys.stderr)
+            print(f"[*] jitter {delay:.1f}s before next apex", file=sys.stderr)
             time.sleep(delay)
         try:
-            if src == "crtsh":
-                print(f"[*] query crt.sh  q={apex} and q=%.{apex}", file=sys.stderr)
-                seen_ids: set[Any] = set()
-                for q in (apex, f"%.{apex}"):
-                    batch = crtsh_json(q, args.exclude_expired, args.dedupe_certs, args.user_agent)
-                    for row in batch:
-                        rid = row.get("id") or row.get("min_cert_id") or id(row)
-                        if rid in seen_ids:
-                            continue
-                        seen_ids.add(rid)
-                        crt_rows.append(row)
-            elif src == "precert":
-                print(f"[*] query precert.ru  q={apex}", file=sys.stderr)
-                precert_rows = precert_json(apex, args.user_agent)
-            else:
-                print(f"[*] query crt.name  apex={apex}", file=sys.stderr)
-                crtname_rows = crtname_json(apex, args.user_agent)
-        except urllib.error.HTTPError as exc:
-            print(f"[!] {src} HTTP {exc.code}", file=sys.stderr)
-        except Exception as exc:
-            print(f"[!] {src} failed: {exc}", file=sys.stderr)
-
-    hits: dict[str, NameHit] = {}
-    ingest(hits, crt_rows, apex, "crtsh", args.siblings)
-    ingest(hits, precert_rows, apex, "precert", args.siblings)
-    ingest(hits, crtname_rows, apex, "crtname", args.siblings)
-
-    scoped = [h for h in hits.values() if h.in_scope]
-    siblings = [h for h in hits.values() if not h.in_scope]
-    scoped.sort(key=lambda h: (parse_ts(h.last_seen) or datetime.min.replace(tzinfo=timezone.utc), h.a_label), reverse=True)
-
-    print(
-        f"[+] {len(crt_rows)} crt.sh rows, {len(precert_rows)} precert.ru rows, "
-        f"{len(crtname_rows)} crt.name rows, "
-        f"{len(scoped)} in-scope names, {len(siblings)} sibling SANs",
-        file=sys.stderr,
-    )
-    by_state: dict[str, int] = {}
-    for h in scoped:
-        by_state[h.state] = by_state.get(h.state, 0) + 1
-    if by_state:
-        print(
-            "[+] states  " + ", ".join(f"{k}={v}" for k, v in sorted(by_state.items())),
-            file=sys.stderr,
-        )
-
-    if not crt_rows and not precert_rows and not crtname_rows:
-        print(f"[!] Google CT: {GOOGLE_CT}", file=sys.stderr)
-        print("[!] Fallbacks: https://precert.ru  (RU Yandex/VK/Mintsifry logs)", file=sys.stderr)
-        print("[!]            https://crt.sh/?q=" + urllib.parse.quote(apex), file=sys.stderr)
-        print("[!]            https://crt.name/v1/search?apex=" + urllib.parse.quote(apex), file=sys.stderr)
-        return 2
-
-    shown = scoped[: args.limit]
-    flagged = []
-    for h in shown:
-        marks = hint_match(h.a_label, hints)
-        if marks:
-            flagged.append((h, marks))
-    if flagged:
-        print("[+] hinted names:", file=sys.stderr)
-        for h, marks in flagged[:25]:
-            label = h.a_label if h.u_label == h.a_label else f"{h.a_label} ({h.u_label})"
-            wild = " *." if h.wildcard else "    "
-            print(f"    {wild}{label}  [{h.state}]  {','.join(marks)}", file=sys.stderr)
-
-    if args.json:
-        payload = []
-        for h in shown:
-            payload.append(
-                {
-                    "name": h.a_label,
-                    "unicode": h.u_label,
-                    "wildcard": h.wildcard,
-                    "state": h.state,
-                    "first_seen": h.first_seen,
-                    "last_seen": h.last_seen,
-                    "not_after": h.not_after,
-                    "issuers": sorted(h.issuers),
-                    "sources": sorted(h.sources),
-                    "hints": hint_match(h.a_label, hints),
-                }
+            shown, siblings, status = harvest_one(
+                domain,
+                args.source,
+                exclude_expired=args.exclude_expired,
+                dedupe_certs=args.dedupe_certs,
+                siblings=args.siblings,
+                user_agent=args.user_agent,
+                no_jitter=args.no_jitter,
+                limit=args.limit,
+                hints=hints,
+                raw=args.raw,
+                do_resolve=args.resolve,
+                nameservers=nameservers,
             )
-        if args.siblings:
-            payload.append(
-                {
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+            print(f"[!] apex {domain} aborted: {exc}", file=sys.stderr)
+            any_fail = True
+            continue
+        apex = to_ascii_domain(domain)
+        if status == 0:
+            any_ok = True
+        else:
+            any_fail = True
+        if args.json:
+            for h in shown:
+                all_payload.append(hit_to_json(h, hints, args.resolve, apex if multi else None))
+            if args.siblings and siblings:
+                sib_block: dict[str, Any] = {
                     "_siblings": [
-                        {"name": s.a_label, "unicode": s.u_label, "wildcard": s.wildcard}
+                        {
+                            "name": s.a_label,
+                            "unicode": s.u_label,
+                            "wildcard": s.wildcard,
+                            **(
+                                {"a_records": list(s.a_records), "dns_status": s.dns_status}
+                                if args.resolve
+                                else {}
+                            ),
+                        }
                         for s in siblings
                     ]
                 }
-            )
-        text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+                if multi:
+                    sib_block["apex"] = apex
+                all_payload.append(sib_block)
+        else:
+            for h in shown:
+                text_lines.append(format_text_line(h, args.resolve, multi, apex))
+
+    if args.json:
+        text = json.dumps(all_payload, ensure_ascii=False, indent=2) + "\n"
     else:
-        lines = []
-        for h in shown:
-            name = h.a_label
-            if h.wildcard:
-                name = "*." + name
-            lines.append(name)
-        text = "\n".join(lines) + ("\n" if lines else "")
+        text = "\n".join(text_lines) + ("\n" if text_lines else "")
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as fh:
@@ -498,15 +897,12 @@ def main() -> int:
     else:
         sys.stdout.write(text)
 
-    if args.raw:
-        for row in crt_rows[:25]:
-            print(
-                f"    {row.get('not_before', '')}  "
-                f"{str(row.get('issuer_name', ''))[:60]}  "
-                f"{str(row.get('name_value', ''))[:80]}",
-                file=sys.stderr,
-            )
-    return 0
+    if any_ok and not any_fail:
+        return 0
+    if any_ok and any_fail:
+        return 1
+    return 2
+
 
 
 if __name__ == "__main__":
