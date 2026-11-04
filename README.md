@@ -2,7 +2,8 @@
 
 **Certificate Transparency Harvester** 
 
-Reads public CT indexes only. It never resolves a name and never connects to a host it printed.
+Reads public CT indexes by default. It does not connect to a discovered host for HTTP/TLS.
+Optional `--resolve` looks up A records (active DNS) against the system resolver or `--nameserver`.
 
 Why this exists:
 
@@ -24,7 +25,10 @@ Why this exists:
 - State: `live` / `cooling` (expired &lt; 90 days) / `historical`
 - Sort by last-seen, not alphabetically, before `--limit`
 - Neutral browser UA
-- Jitter between backends; 3 attempts on 502 / HTML-as-JSON
+- Jitter between backends and between apexes in a file; 3 attempts on 502 / HTML-as-JSON
+- Batch apexes from a file (`-iL` / `--input-file`, or `-` for stdin); `-d` and `-iL` are mutually exclusive
+- Optional A-record resolve (`--resolve`) with a stdlib DNS client; `--nameserver` picks the resolvers (implies `--resolve`)
+- Live `-o` writing as each apex finishes (text/CSV append+flush; JSON atomic rewrite); optional `--csv` output
 - Stdlib only (`python3`), no pip
 
 `--json` is the record format. Default stdout is still one name per line so it pipes into the rest of S4.
@@ -66,9 +70,30 @@ python3 certcreep.py -d example.ru --source crtsh,precert
 
 # Keep partner / CDN SANs that shared a cert with the apex
 python3 certcreep.py -d vk.com --siblings --limit 80
+
+# Several apexes from a file (one per line; # and blanks skipped). Text lines are apex\tname
+python3 certcreep.py -iL domains.txt --source crtsh --limit 40 -o ct-batch.txt
+printf 'sqlite.org\nexample.com\n' | python3 certcreep.py -iL - --source crtname --limit 5
+
+# Resolve A records (system resolver). Wildcards are skipped.
+python3 certcreep.py -d sqlite.org --source crtname --limit 20 --resolve --json -o ct-resolve.json
+
+# Same, but ask Yandex DNS then Quad9 (tried in order on failure). Implies --resolve.
+python3 certcreep.py -d sqlite.org --source crtname --limit 20 --nameserver 77.88.8.8,9.9.9.9
 ```
 
-Stderr is the operator view (counts, states, hinted names). Stdout / `-o` is the list.
+Stderr is the operator view (counts, states, hinted names, resolve summary). Stdout / `-o` is the list.
+With `-iL` and more than one apex, text lines are `apex\tname` (plus `\tIPs` when resolving); JSON records carry an `apex` field.
+
+### Live output
+
+Results are written **as each apex finishes** (after its CT queries and optional `--resolve`), not once at the end:
+
+- **Text** (`-o` or stdout): lines are appended and flushed. `tail -f outfile.txt` shows names appear between apexes.
+- **CSV** (`--csv`, with or without `-o`): header row first, then one row per name appended and flushed after each apex (`tail -f` friendly). Columns: `apex`, `name`, `unicode`, `wildcard`, `state`, `first_seen`, `last_seen`, `not_after`, `issuers`, `sources`, `hints`, plus `a_records` / `dns_status` when `--resolve`. Multi-value fields are joined with `;`. `--csv` and `--json` are mutually exclusive.
+- **JSON + `-o`**: the file stays a single JSON array. After each apex the whole array is rewritten via a temp file + `os.replace`, so the file is always valid JSON (including `[]` before the first apex). A crash or Ctrl-C leaves the last successful rewrite.
+- **JSON without `-o`**: one array is printed to stdout when the run ends (pipes still get valid JSON).
+- Within an apex, names are still merged/deduped across sources before anything is written; each apex is emitted once.
 
 If every queried index fails:
 
@@ -92,18 +117,22 @@ If every queried index fails:
 
 | Flag | Default | Point |
 |------|---------|--------|
-| `-d / --domain` | required | Apex or IDN |
-| `-o / --output` | stdout | Write the list / JSON |
-| `--limit` | 200 | Applied **after** last-seen sort |
+| `-d / --domain` | one of `-d` / `-iL` required | Apex or IDN |
+| `-iL / --input-file` | one of `-d` / `-iL` required | File of apexes (one per line; `#` and blanks skipped; deduped). `-` reads stdin. Mutually exclusive with `-d` |
+| `-o / --output` | stdout | Live write: text/CSV append+flush after each apex; JSON array rewritten atomically after each apex |
+| `--limit` | 200 | Applied **after** last-seen sort, **per apex** |
 | `--source` | `all` | `crtsh` \| `precert` \| `crtname` \| `all` (crt.sh + precert.ru + crt.name), or a comma-separated list such as `crtsh,precert`. Case-insensitive; spaces and duplicates ignored; `all` anywhere in the list means every index. Unknown or empty entries are an error. Query order is always crt.sh → precert.ru → crt.name |
 | `--exclude-expired` | off | crt.sh `exclude=expired` — current surface, not naming history |
 | `--dedupe-certs` | off | crt.sh `deduplicate=Y` |
 | `--siblings` | off | Keep out-of-scope SANs |
-| `--json` | off | Records with unicode, state, issuers, sources, hints |
+| `--json` | off | Records with unicode, state, issuers, sources, hints (and `a_records` / `dns_status` with `--resolve`). With `-o`, rewritten after each apex; without `-o`, one array at exit. Mutually exclusive with `--csv` |
+| `--csv` | off | CSV with header; columns match JSON fields (`apex` always present; multi-values joined with `;`). Append+flush after each apex. Mutually exclusive with `--json` |
 | `--raw` | off | First 25 raw crt.sh rows on stderr |
 | `--hints` | built-in list | Empty string disables |
 | `--user-agent` | Firefox/Linux | User-Agent header for all requests |
-| `--no-jitter` | off | Back-to-back backends (don't) |
+| `--no-jitter` | off | Back-to-back backends and apexes (don't) |
+| `--resolve` | off | Look up A records for each printed name (thread pool, 3 s timeout). Wildcards get `dns_status=skipped:wildcard`. Text lines append `\tIP,IP` or `\t[status]`; JSON adds `a_records` and `dns_status` |
+| `--nameserver` | system resolver | Comma-separated IPv4/IPv6 addresses used as DNS servers for `--resolve` (implies `--resolve`). Tried in order on timeout/error. Empty or non-IP entries are an argparse error. Example: `77.88.8.8,9.9.9.9` |
 
 ---
 
@@ -117,7 +146,8 @@ Passive to the **target** is not passive to the **index**. crt.sh (Sectigo), pre
 4. **Three backends, separate operators.** crt.sh ≈ Chrome-log world. precert.ru ≈ Yandex Agate + VK NCA + Минцифры. crt.name ≈ a CT-derived subdomain index run by Defendio (EU). Pick `--source` on purpose. Default `all` (crt.sh + precert.ru + crt.name) waits 1–3 s between each; a comma list (`crtsh,precert`) sends the query only to the listed indexes, with the same jitter; a single `--source` sends it to that index only.
 5. **Burst.** Thirty Kalis hitting `yandex.ru` in the same second look like abuse and 502 the index. Stagger. A portal cache of the practice JSON (same pattern as `/research` for BDU) is the right next range change; it is not in this folder.
 6. **TLS persona.** Stock CPython `urllib`.
-7. **What this client will not do.** No CertSpotter + Shodan CTL + Censys (more copies of the query). crt.name is in the default `all`; to keep the query off it, use `--source crtsh,precert` (or a single index). No live DNS. No Google Transparency Report scrape (browser fallback only).
+7. **What this client will not do.** No CertSpotter + Shodan CTL + Censys (more copies of the query). crt.name is in the default `all`; to keep the query off it, use `--source crtsh,precert` (or a single index). No live HTTP/TLS to discovered hosts. No Google Transparency Report scrape (browser fallback only).
+8. **`--resolve` is active.** A CT harvest alone never talks to the target. `--resolve` (or `--nameserver`) sends an A query for every printed name to the chosen resolvers. That is visible to those resolvers and, when they recurse, to the target's authoritative servers. Prefer resolvers you control or trust for the jurisdiction; the default system resolver is whatever the host's `/etc/resolv.conf` points at. Wildcards are not queried. Jitter between apexes still applies; DNS lookups for one apex are concurrent (bounded thread pool).
 
 ---
 
@@ -125,6 +155,7 @@ Passive to the **target** is not passive to the **index**. crt.sh (Sectigo), pre
 
 | Code | Meaning |
 |------|---------|
-| 0 | At least one index returned rows |
-| 2 | Every queried index failed; fallback URLs printed on stderr |
+| 0 | Every apex got rows from at least one index |
+| 1 | Mixed: some apexes succeeded, at least one failed (batch `-iL` runs) |
+| 2 | Every apex failed (or the only apex failed); fallback URLs printed on stderr |
 
